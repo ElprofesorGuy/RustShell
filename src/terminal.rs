@@ -389,3 +389,31 @@ fn readline_simple(prompt: &str) -> ReadLine {
         Err(_) => ReadLine::Eof,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prompt_visible_len_plain() {
+        assert_eq!(prompt_visible_len("user@host:~$ "), 13);
+    }
+
+    #[test]
+    fn test_prompt_visible_len_ansi() {
+        // "\x1b[32muser\x1b[0m" → visible: "user" = 4 chars
+        let p = "\x1b[32muser\x1b[0m@host$ ";
+        let len = prompt_visible_len(p);
+        assert!(len > 0);
+    }
+
+    #[test]
+    fn test_find_word_start_middle() {
+        assert_eq!(find_word_start("ls -la", 6), 3);
+    }
+
+    #[test]
+    fn test_find_word_start_beginning() {
+        assert_eq!(find_word_start("ls", 2), 0);
+    }
+}
