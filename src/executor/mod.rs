@@ -215,3 +215,68 @@ fn build_process_with_argv(
     let child = proc.spawn().map_err(|e| format!("rustshell: {}: {}", name, e))?;
     Ok(Some(child))
 }
+
+
+fn apply_stdin_redirect(cmd: &Command, proc: &mut process::Command) -> Result<(), String> {
+    for r in &cmd.redirects {
+        if r.kind == RedirectKind::Stdin {
+            let path = match &r.target { RedirectTarget::File(p) | RedirectTarget::FileAppend(p) => p };
+            let file = std::fs::File::open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+            proc.stdin(Stdio::from(file));
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn apply_stdout_redirect(cmd: &Command, proc: &mut process::Command) -> Result<(), String> {
+    for r in &cmd.redirects {
+        match (&r.kind, &r.target) {
+            (RedirectKind::Stdout, RedirectTarget::File(path)) => {
+                let file = OpenOptions::new().write(true).create(true).truncate(true).open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+                proc.stdout(Stdio::from(file));
+                return Ok(());
+            }
+            (RedirectKind::Stdout, RedirectTarget::FileAppend(path)) => {
+                let file = OpenOptions::new().write(true).create(true).append(true).open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+                proc.stdout(Stdio::from(file));
+                return Ok(());
+            }
+            (RedirectKind::StdoutStderr, RedirectTarget::File(path)) => {
+                let file = OpenOptions::new().write(true).create(true).truncate(true).open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+                let file2 = file.try_clone().map_err(|e| e.to_string())?;
+                proc.stdout(Stdio::from(file));
+                proc.stderr(Stdio::from(file2));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn apply_stderr_redirect(cmd: &Command, proc: &mut process::Command) -> Result<(), String> {
+    for r in &cmd.redirects {
+        if r.kind == RedirectKind::Stderr {
+            let path = match &r.target { RedirectTarget::File(p) | RedirectTarget::FileAppend(p) => p };
+            let file = OpenOptions::new().write(true).create(true).truncate(true).open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+            proc.stderr(Stdio::from(file));
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+pub fn resolve_path(name: &str, ctx: &ExecContext) -> Option<String> {
+    if name.contains('/') {
+        if std::path::Path::new(name).exists() { return Some(name.to_string()); }
+        return None;
+    }
+    let path_env = ctx.env.get("PATH").map(|s| s.as_str()).unwrap_or("/usr/local/bin:/usr/bin:/bin");
+    for dir in path_env.split(':') {
+        let full = format!("{}/{}", dir, name);
+        if std::path::Path::new(&full).exists() { return Some(full); }
+    }
+    None
+}
+
