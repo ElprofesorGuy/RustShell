@@ -40,3 +40,44 @@ impl ExecContext {
         }
     }
 }
+
+
+
+
+/// Point d'entrée : exécute une CommandList complète.
+pub fn execute_list(list: &CommandList, ctx: &mut ExecContext) -> i32 {
+    let mut last_exit = ctx.last_exit;
+
+    for item in &list.items {
+        // Évaluer la condition d'exécution selon le connecteur précédent
+        let should_run = match item.connector {
+            Connector::None | Connector::Semicolon => true,
+            Connector::And => last_exit == 0,
+            Connector::Or => last_exit != 0,
+        };
+
+        if should_run {
+            last_exit = execute_pipeline(&item.pipeline, ctx);
+            ctx.last_exit = last_exit;
+        }
+    }
+
+    last_exit
+}
+
+/// Exécute un pipeline (une ou plusieurs commandes reliées par pipes).
+pub fn execute_pipeline(pipeline: &Pipeline, ctx: &mut ExecContext) -> i32 {
+    let commands = &pipeline.commands;
+
+    if commands.is_empty() {
+        return 0;
+    }
+
+    // Cas simple : une seule commande (pas de pipe)
+    if commands.len() == 1 {
+        return execute_command(&commands[0], ctx, None, None, pipeline.background);
+    }
+
+    // Pipeline multi-commandes : créer les pipes
+    execute_pipeline_multi(commands, ctx, pipeline.background)
+}
