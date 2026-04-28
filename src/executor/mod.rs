@@ -1,8 +1,25 @@
-// Module exécuteur (executor) pour le shell RustShell
-//
-// Tâches à implémenter :
-// - Définir une structure pour représenter une commande (nom, arguments)
-// - Implémenter une fonction pour exécuter une commande simple (utiliser std::process::Command)
-// - Gérer les commandes built-in (comme cd, exit, etc.) et les commandes externes
-// - Traiter les codes de retour et les erreurs d'exécution
-// - Intégrer avec les autres modules pour l'exécution de pipelines et jobs
+//! Module executor : exécution des commandes simples et builtins.
+//!
+//! Résout les chemins via $PATH, fork/exec via std::process::Command,
+//! gère les codes de retour, et implémente cd, pwd, exit, export.
+
+
+// =============================================================================
+// @JACQUES :  TA PARTIE ICI (STRUCTURE ET EXECUTION CORE)
+// =============================================================================
+
+// TODO: Jacques doit ecrire son bloc de code ici.
+
+
+// =============================================================================
+// @NOELY :  TA PARTIE ICI (SUBSTITUTION ET BUILTINS)
+// =============================================================================
+
+// TODO: Noely doit ecrire son bloc de code ici.
+
+
+// =============================================================================
+// @TESTS : (OPTIONNEL)
+// =============================================================================
+
+// coller les tests ici à la fin.
