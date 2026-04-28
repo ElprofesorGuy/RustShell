@@ -169,3 +169,186 @@ fn load_from_disk(path: &PathBuf) -> Vec<String> {
         Vec::new()
     }
 }
+/// Retourne le chemin vers le fichier d'historique.
+fn history_file_path() -> PathBuf {
+    dirs_home().join(".rustshell_history")
+}
+
+/// Obtient le répertoire home de l'utilisateur.
+fn dirs_home() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+// ─── Autocomplétion ──────────────────────────────────────────────────────────
+
+/// Autocomplétion des noms de fichiers et de commandes.
+/// Retourne la liste des complétions pour un préfixe donné.
+pub fn complete(prefix: &str, complete_commands: bool) -> Vec<String> {
+    let mut completions = Vec::new();
+
+    if prefix.contains('/') || prefix.starts_with('.') || prefix.starts_with('~') {
+        // Complétion de chemin
+        complete_path(prefix, &mut completions);
+    } else if complete_commands {
+        // Complétion de commande (PATH + builtins)
+        complete_command(prefix, &mut completions);
+    } else {
+        // Complétion de fichier dans le répertoire courant
+        complete_path(prefix, &mut completions);
+    }
+
+    completions.sort();
+    completions.dedup();
+    completions
+}
+
+fn complete_path(prefix: &str, completions: &mut Vec<String>) {
+    // Séparer le répertoire du préfixe de nom
+    let (dir, name_prefix) = if let Some(pos) = prefix.rfind('/') {
+        (&prefix[..=pos], &prefix[pos + 1..])
+    } else {
+        ("./", prefix)
+    };
+
+    let dir_path = if dir == "./" { std::path::Path::new(".") } else { std::path::Path::new(dir) };
+
+    if let Ok(entries) = fs::read_dir(dir_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(name_prefix) {
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let full = if dir == "./" {
+                    if is_dir {
+                        format!("{}/", name_str)
+                    } else {
+                        name_str.to_string()
+                    }
+                } else {
+                    if is_dir {
+                        format!("{}{}/", dir, name_str)
+                    } else {
+                        format!("{}{}", dir, name_str)
+                    }
+                };
+                completions.push(full);
+            }
+        }
+    }
+}
+
+fn complete_command(prefix: &str, completions: &mut Vec<String>) {
+    // Builtins
+    let builtins = ["cd", "pwd", "exit", "export", "unset", "echo", "true", "false", "type", "jobs", "fg", "bg", "history"];
+    for b in &builtins {
+        if b.starts_with(prefix) {
+            completions.push(b.to_string());
+        }
+    }
+
+    // Commandes dans $PATH
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy().to_string();
+                    if name_str.starts_with(prefix) {
+                        // Vérifier que c'est exécutable
+                        if let Ok(meta) = entry.metadata() {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if meta.permissions().mode() & 0o111 != 0 {
+                                    completions.push(name_str);
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            completions.push(name_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Trouve le plus long préfixe commun d'une liste de chaînes.
+pub fn common_prefix(completions: &[String]) -> String {
+    if completions.is_empty() {
+        return String::new();
+    }
+    if completions.len() == 1 {
+        return completions[0].clone();
+    }
+
+    let first = &completions[0];
+    let mut len = first.len();
+
+    for s in &completions[1..] {
+        len = first.chars().zip(s.chars())
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(len);
+    }
+
+    first[..len].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_history() {
+        let mut h = History {
+            entries: Vec::new(),
+            path: PathBuf::from("/tmp/test_rustshell_history"),
+            nav_index: None,
+            saved_line: String::new(),
+        };
+        h.add("ls -la");
+        h.add("pwd");
+        assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn test_no_duplicates() {
+        let mut h = History {
+            entries: Vec::new(),
+            path: PathBuf::from("/tmp/test_rustshell_history"),
+            nav_index: None,
+            saved_line: String::new(),
+        };
+        h.add("ls");
+        h.add("ls");
+        assert_eq!(h.len(), 1);
+    }
+
+    #[test]
+    fn test_nav_prev_next() {
+        let mut h = History {
+            entries: vec!["cmd1".into(), "cmd2".into(), "cmd3".into()],
+            path: PathBuf::from("/tmp/test_rustshell_history"),
+            nav_index: None,
+            saved_line: String::new(),
+        };
+        assert_eq!(h.prev(""), Some("cmd3"));
+        assert_eq!(h.prev(""), Some("cmd2"));
+        assert_eq!(h.next(), Some("cmd3"));
+    }
+
+    #[test]
+    fn test_common_prefix() {
+        let comps = vec!["foobar".into(), "foobaz".into(), "fooqix".into()];
+        assert_eq!(common_prefix(&comps), "foo");
+    }
+
+    #[test]
+    fn test_common_prefix_single() {
+        let comps = vec!["hello".into()];
+        assert_eq!(common_prefix(&comps), "hello");
+    }
+}
