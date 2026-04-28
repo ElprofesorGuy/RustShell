@@ -143,3 +143,75 @@ fn execute_pipeline_multi(commands: &[Command], ctx: &mut ExecContext, backgroun
     }
     last_exit
 }
+
+
+
+pub fn execute_command(
+    cmd: &Command,
+    ctx: &mut ExecContext,
+    stdin_override: Option<i32>,
+    stdout_override: Option<i32>,
+    background: bool,
+) -> i32 {
+    if cmd.argv.is_empty() { return 0; }
+
+    let expanded_argv: Vec<String> = cmd.argv.iter().map(|arg| expand_vars(arg, ctx)).collect();
+    let expanded_argv = expand_args(&expanded_argv);
+
+    if let Some(exit_code) = try_builtin(&expanded_argv, ctx) { return exit_code; }
+
+    match build_process_with_argv(cmd, &expanded_argv, ctx, stdin_override, stdout_override) {
+        Ok(Some(mut child)) => {
+            if background {
+                let pid = child.id();
+                ctx.jobs.add(pid, expanded_argv.join(" ").as_str());
+                println!("[{}] {}", ctx.jobs.len(), pid);
+                0
+            } else {
+                child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+            }
+        }
+        Ok(None) => ctx.last_exit,
+        Err(e) => { eprintln!("{}", e); 127 }
+    }
+}
+
+fn build_process(
+    cmd: &Command,
+    ctx: &mut ExecContext,
+    stdin_fd: Option<i32>,
+    stdout_fd: Option<i32>,
+) -> Result<Option<process::Child>, String> {
+    let expanded_argv: Vec<String> = cmd.argv.iter().map(|arg| expand_vars(arg, ctx)).collect();
+    build_process_with_argv(cmd, &expanded_argv, ctx, stdin_fd, stdout_fd)
+}
+
+fn build_process_with_argv(
+    cmd: &Command,
+    argv: &[String],
+    ctx: &mut ExecContext,
+    stdin_fd: Option<i32>,
+    stdout_fd: Option<i32>,
+) -> Result<Option<process::Child>, String> {
+    if argv.is_empty() { return Err("rustshell: commande vide".into()); }
+    let name = &argv[0];
+    let path = resolve_path(name, ctx).ok_or_else(|| format!("rustshell: {}: commande introuvable", name))?;
+    let mut proc = process::Command::new(&path);
+    proc.args(&argv[1..]);
+    proc.env_clear();
+    for (k, v) in &ctx.env { proc.env(k, v); }
+
+    if let Some(fd) = stdin_fd {
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        proc.stdin(Stdio::from(f));
+    } else { apply_stdin_redirect(cmd, &mut proc)?; }
+
+    if let Some(fd) = stdout_fd {
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        proc.stdout(Stdio::from(f));
+    } else { apply_stdout_redirect(cmd, &mut proc)?; }
+
+    apply_stderr_redirect(cmd, &mut proc)?;
+    let child = proc.spawn().map_err(|e| format!("rustshell: {}: {}", name, e))?;
+    Ok(Some(child))
+}
