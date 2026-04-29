@@ -4,17 +4,6 @@
 
 RustShell est un projet pédagogique de programmation système : lexer, parser, exécuteur de commandes, pipes Unix, redirections de flux, gestion des jobs et signaux, historique persistant, autocomplétion — tout implémenté à la main, sans bibliothèque shell tierce.
 
-```
-user@host:~$ echo "Bonjour depuis RustShell !"
-Bonjour depuis RustShell !
-user@host:~$ ls src/ | grep mod | wc -l
-5
-user@host:~$ sleep 5 &
-[1] 12345
-user@host:~$ jobs
-[1]    12345  En cours  sleep 5
-```
-
 ---
 
 ## Table des matières
@@ -94,6 +83,10 @@ rustshell/
     │   └── mod.rs        # JobTable, Job, JobStatus, fg/bg, signaux
     └── history/
         └── mod.rs        # History, persist, navigation, autocomplétion
+    └── glob.rs
+    └── main.rs
+    └── prompt.rs
+    └── terminal.rs
 ```
 
 ### Pipeline de traitement d'une commande
@@ -140,7 +133,7 @@ Saisie utilisateur
 
 ```bash
 # 1. Cloner le dépôt
-git clone https://github.com/votre-compte/rustshell.git
+git clone https://github.com/ElprofesorGuy/RustShell.git
 cd rustshell
 
 # 2. Compiler en mode release
@@ -151,13 +144,6 @@ cargo build --release
 
 # 4. (Optionnel) Installer dans $PATH
 sudo cp target/release/rustshell /usr/local/bin/rustshell
-```
-
-### Vérification de l'installation
-
-```bash
-rustshell --version   # pas encore implémenté : rustshell v0.1.0
-echo $SHELL           # vérifier depuis l'intérieur du shell
 ```
 
 ### Définir comme shell par défaut (optionnel, avancé)
@@ -183,7 +169,7 @@ chsh -s /usr/local/bin/rustshell
 ```
 
 ```
-RustShell v0.1.0 — tapez 'exit' pour quitter, 'help' pour l'aide
+RustShell v0.2.0 — tapez 'exit' pour quitter, 'help' pour l'aide
 user@hostname:~$
 ```
 

@@ -15,9 +15,9 @@ use std::fs::OpenOptions;
 use std::os::unix::io::FromRawFd;
 use std::process::{self, Stdio};
 
-use crate::jobs::JobTable;
+use crate::jobs::JobList;
 use crate::glob::expand_args;
-use crate::parser::{Command, CommandList, Connector, Pipeline, RedirectKind, RedirectTarget};
+use crate::pipes::{Command, CommandList, Connector, Pipeline, RedirectKind, RedirectTarget};
 
 /// Contexte d'exécution partagé entre toutes les commandes.
 pub struct ExecContext {
@@ -26,7 +26,7 @@ pub struct ExecContext {
     /// Dernier code de retour
     pub last_exit: i32,
     /// Table des jobs actifs
-    pub jobs: JobTable,
+    pub jobs: JobList,
 }
 
 impl ExecContext {
@@ -36,7 +36,7 @@ impl ExecContext {
         ExecContext {
             env,
             last_exit: 0,
-            jobs: JobTable::new(),
+            jobs: JobList::new(),
         }
     }
 }
@@ -281,8 +281,8 @@ pub fn resolve_path(name: &str, ctx: &ExecContext) -> Option<String> {
 }
 
 
-//! PARTIE DE NOËLLY : EXPANSION ET BUILTINS
-//Tâches : expand_vars, command_substitution, try_builtin, et tous les builtin_ (cd, pwd, export, etc.).
+/// PARTIE DE NOËLLY : EXPANSION ET BUILTINS
+/// Tâches : expand_vars, command_substitution, try_builtin, et tous les builtin_ (cd, pwd, export, etc.).
 
 pub fn expand_vars(s: &str, ctx: &mut ExecContext) -> String {
     let mut result = String::with_capacity(s.len());
@@ -331,7 +331,7 @@ pub fn expand_vars(s: &str, ctx: &mut ExecContext) -> String {
 pub fn command_substitution(cmd_str: &str, ctx: &mut ExecContext) -> String {
     use std::process::{Command, Stdio};
     let tokens = match crate::lexer::tokenize(cmd_str) { Ok(t) => t, Err(_) => return String::new() };
-    let list = match crate::parser::parse(&tokens) { Ok(l) => l, Err(_) => return String::new() };
+    let list = match crate::pipes::parse(&tokens) { Ok(l) => l, Err(_) => return String::new() };
     if list.items.is_empty() { return String::new(); }
     let pipeline = &list.items[0].pipeline;
     if pipeline.commands.is_empty() { return String::new(); }
@@ -404,14 +404,21 @@ fn builtin_export(argv: &[String], ctx: &mut ExecContext) -> i32 {
             let key = arg[..eq].to_string();
             let val = arg[eq+1..].to_string();
             ctx.env.insert(key.clone(), val.clone());
-            std::env::set_var(&key, &val);
+            unsafe {
+                std::env::set_var(&key, &val);
+            }
         } else if let Ok(val) = std::env::var(arg) { ctx.env.insert(arg.clone(), val); }
     }
     0
 }
 
 fn builtin_unset(argv: &[String], ctx: &mut ExecContext) -> i32 {
-    for arg in &argv[1..] { ctx.env.remove(arg); std::env::remove_var(arg); }
+    for arg in &argv[1..] {
+        ctx.env.remove(arg);
+        unsafe {
+            std::env::remove_var(arg);
+        }
+    }
     0
 }
 

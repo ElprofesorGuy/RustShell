@@ -26,7 +26,7 @@ impl fmt::Display for JobState {
         match self {
             JobState::Running => write!(f, "Running"),
             JobState::Stopped => write!(f, "Stopped"),
-            JobState::Done => write!(f, "Done"),
+            JobState::Done(_) => write!(f, "Done"),
         }
     }
 }
@@ -118,11 +118,39 @@ impl JobList {
         let done_ids: Vec<usize> = self
             .jobs
             .iter()
-            .filter(|(_, j)| j.state == JobState::Done)
+            .filter(|(_, j)| matches!(j.state, JobState::Done(_)))
             .map(|(id, _)| *id)
             .collect();
 
         for id in done_ids {
+            if let Some(job) = self.jobs.remove(&id) {
+                println!("[{}]\tDone\t\t{}", job.id, job.command);
+            }
+        }
+    }
+
+    // Wrapper methods for compatibility
+    pub fn add(&mut self, pid: u32, command: &str) -> usize {
+        self.add_job(pid, command.to_string(), false)
+    }
+
+    pub fn len(&self) -> usize {
+        self.jobs.len()
+    }
+
+    pub fn reap_zombies(&mut self) {
+        self.update_jobs();
+    }
+
+    pub fn notify_and_clean(&mut self) {
+        let done: Vec<usize> = self
+            .jobs
+            .iter()
+            .filter(|(_, j)| matches!(j.state, JobState::Done(_)))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in done {
             if let Some(job) = self.jobs.remove(&id) {
                 println!("[{}]\tDone\t\t{}", job.id, job.command);
             }
@@ -163,7 +191,7 @@ impl JobList {
             }
         };
 
-        if job.state == JobState::Done {
+        if job.state == JobState::Done(0) {
             eprintln!("fg: job {} est déjà terminé", id);
             return;
         }
@@ -199,7 +227,8 @@ impl JobList {
                 println!("\n[{}]\tStopped\t\t{}", job.id, job.command);
             }
         } else {
-            self.update_state(id, JobState::Done);
+            let exit_code = if is_exited(status) { get_exit_code(status) } else { 1 };
+            self.update_state(id, JobState::Done(exit_code));
             self.cleanup_done();
         }
     }
@@ -320,7 +349,8 @@ impl JobList {
 
             if result > 0 {
                 if is_exited(status) || is_signaled(status) {
-                    self.update_state(id, JobState::Done);
+                    let exit_code = if is_exited(status) { get_exit_code(status) } else { 1 };
+                    self.update_state(id, JobState::Done(exit_code));
                 } else if is_stopped(status) {
                     self.update_state(id, JobState::Stopped);
                 }
@@ -398,17 +428,22 @@ pub fn setup_sigchld_handler() {
 // fonctions utilitaires pour analyser le status waitpid
 #[cfg(unix)]
 fn is_exited(status: i32) -> bool {
-    unsafe { libc::WIFEXITED(status) }
+    libc::WIFEXITED(status)
 }
 
 #[cfg(unix)]
 fn is_signaled(status: i32) -> bool {
-    unsafe { libc::WIFSIGNALED(status) }
+    libc::WIFSIGNALED(status)
 }
 
 #[cfg(unix)]
 fn is_stopped(status: i32) -> bool {
-    unsafe { libc::WIFSTOPPED(status) }
+    libc::WIFSTOPPED(status)
+}
+
+#[cfg(unix)]
+fn get_exit_code(status: i32) -> i32 {
+    libc::WEXITSTATUS(status)
 }
 
 // parser l'argument de fg/bg pour extraire le job id
@@ -420,6 +455,37 @@ pub fn parse_job_id(arg: Option<&str>) -> Option<usize> {
             s.parse::<usize>().ok()
         }
     }
+}
+
+/// Commande builtin `jobs` : afficher les jobs actifs.
+pub fn builtin_jobs(table: &mut JobList) -> i32 {
+    table.reap_zombies();
+    table.builtin_jobs();
+    0
+}
+
+/// Commande builtin `fg [%n]` : ramener un job au premier plan.
+pub fn builtin_fg(argv: &[String], table: &mut JobList) -> i32 {
+    let job_id = if let Some(arg) = argv.get(1) {
+        parse_job_id(Some(arg.as_str()))
+    } else {
+        None
+    };
+
+    table.builtin_fg(job_id);
+    0
+}
+
+/// Commande builtin `bg [%n]` : reprendre un job en arrière-plan.
+pub fn builtin_bg(argv: &[String], table: &mut JobList) -> i32 {
+    let job_id = if let Some(arg) = argv.get(1) {
+        parse_job_id(Some(arg.as_str()))
+    } else {
+        None
+    };
+
+    table.builtin_bg(job_id);
+    0
 }
 
 #[cfg(test)]
@@ -523,7 +589,7 @@ mod tests {
     fn test_state_display() {
         assert_eq!(format!("{}", JobState::Running), "Running");
         assert_eq!(format!("{}", JobState::Stopped), "Stopped");
-        assert_eq!(format!("{}", JobState::Done), "Done");
+        assert_eq!(format!("{}", JobState::Done(0)), "Done");
     }
 
     #[test]
@@ -531,7 +597,7 @@ mod tests {
         let mut list = JobList::new();
         list.add_job(100, "cmd1".to_string(), true);
         list.add_job(200, "cmd2".to_string(), true);
-        list.update_state(1, JobState::Done);
+        list.update_state(1, JobState::Done(0));
 
         list.cleanup_done();
 

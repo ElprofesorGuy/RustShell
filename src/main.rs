@@ -2,7 +2,7 @@
 /// Améliorations : prompt dynamique Git, globbing, couleurs, Ctrl+R, $(), script démo.
 
 mod lexer;
-mod parser;
+mod pipes;
 mod executor;
 mod jobs;
 mod history;
@@ -12,12 +12,12 @@ mod glob;
 
 use executor::ExecContext;
 use history::History;
-use jobs::{builtin_jobs, builtin_fg, builtin_bg, setup_signal_handlers};
+use jobs::{setup_sigchld_handler, builtin_jobs, builtin_fg, builtin_bg};
 use terminal::{readline, ReadLine};
 use prompt::{build_prompt, shorten_path, print_error, RESET, BOLD, YELLOW};
 
 fn main() {
-    setup_signal_handlers();
+    setup_sigchld_handler();
 
     let mut ctx = ExecContext::new();
     let mut history = History::new();
@@ -55,7 +55,7 @@ fn main() {
                 };
 
                 // Phase 2 : Parsing
-                let cmd_list = match parser::parse(&tokens) {
+                let cmd_list = match pipes::parse(&tokens) {
                     Ok(list) => list,
                     Err(e) => {
                         print_error(&e.to_string());
