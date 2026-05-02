@@ -194,6 +194,7 @@ fn read_word(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<String,
 }
 // - Gérer les espaces, les guillemets pour les arguments avec espaces, et les opérateurs spéciaux
 // - Traiter les erreurs de syntaxe de base (tokens invalides)
+
 /// Lit le contenu d'une chaîne à guillemets doubles jusqu'au prochain `"`.
 fn read_double_quoted(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<String, LexError> {
     let mut s = String::new();

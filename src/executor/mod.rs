@@ -1,8 +1,442 @@
-// Module exécuteur (executor) pour le shell RustShell
-//
-// Tâches à implémenter :
-// - Définir une structure pour représenter une commande (nom, arguments)
-// - Implémenter une fonction pour exécuter une commande simple (utiliser std::process::Command)
-// - Gérer les commandes built-in (comme cd, exit, etc.) et les commandes externes
-// - Traiter les codes de retour et les erreurs d'exécution
-// - Intégrer avec les autres modules pour l'exécution de pipelines et jobs
+//! Module executor : exécution des commandes simples et builtins.
+//!
+//! Résout les chemins via $PATH, fork/exec via std::process::Command,
+//! gère les codes de retour, et implémente cd, pwd, exit, export.
+//!
+//! PARTIE DE JACQUES : STRUCTURE ET EXECUTION CORE
+//! Tâches : Imports, ExecContext, execute_list, execute_pipeline, pipelines multi, build_process, redirections, et resolve_path.
+//! 
+//! 
+
+
+use std::collections::HashMap;
+use std::env;
+use std::fs::OpenOptions;
+use std::os::unix::io::FromRawFd;
+use std::process::{self, Stdio};
+
+use crate::jobs::JobList;
+use crate::glob::expand_args;
+use crate::pipes::{Command, CommandList, Connector, Pipeline, RedirectKind, RedirectTarget};
+
+/// Contexte d'exécution partagé entre toutes les commandes.
+pub struct ExecContext {
+    /// Variables d'environnement du shell (exportées aux processus enfants)
+    pub env: HashMap<String, String>,
+    /// Dernier code de retour
+    pub last_exit: i32,
+    /// Table des jobs actifs
+    pub jobs: JobList,
+}
+
+impl ExecContext {
+    pub fn new() -> Self {
+        // Hériter des variables d'environnement du processus parent
+        let env: HashMap<String, String> = env::vars().collect();
+        ExecContext {
+            env,
+            last_exit: 0,
+            jobs: JobList::new(),
+        }
+    }
+}
+
+
+
+
+/// Point d'entrée : exécute une CommandList complète.
+pub fn execute_list(list: &CommandList, ctx: &mut ExecContext) -> i32 {
+    let mut last_exit = ctx.last_exit;
+
+    for item in &list.items {
+        // Évaluer la condition d'exécution selon le connecteur précédent
+        let should_run = match item.connector {
+            Connector::None | Connector::Semicolon => true,
+            Connector::And => last_exit == 0,
+            Connector::Or => last_exit != 0,
+        };
+
+        if should_run {
+            last_exit = execute_pipeline(&item.pipeline, ctx);
+            ctx.last_exit = last_exit;
+        }
+    }
+
+    last_exit
+}
+
+/// Exécute un pipeline (une ou plusieurs commandes reliées par pipes).
+pub fn execute_pipeline(pipeline: &Pipeline, ctx: &mut ExecContext) -> i32 {
+    let commands = &pipeline.commands;
+
+    if commands.is_empty() {
+        return 0;
+    }
+
+    // Cas simple : une seule commande (pas de pipe)
+    if commands.len() == 1 {
+        return execute_command(&commands[0], ctx, None, None, pipeline.background);
+    }
+
+    // Pipeline multi-commandes : créer les pipes
+    execute_pipeline_multi(commands, ctx, pipeline.background)
+}
+
+
+/// Gère un pipeline de N commandes avec N-1 pipes.
+fn execute_pipeline_multi(commands: &[Command], ctx: &mut ExecContext, background: bool) -> i32 {
+    use libc::{close, pipe};
+
+    let n = commands.len();
+    let mut pipes: Vec<(i32, i32)> = Vec::with_capacity(n - 1);
+
+    // Créer tous les pipes nécessaires
+    for _ in 0..n - 1 {
+        let mut fds = [0i32; 2];
+        unsafe {
+            if pipe(fds.as_mut_ptr()) != 0 {
+                eprintln!("rustshell: impossible de créer un pipe");
+                return 1;
+            }
+        }
+        pipes.push((fds[0], fds[1]));
+    }
+
+    let mut children: Vec<process::Child> = Vec::new();
+
+    for (i, cmd) in commands.iter().enumerate() {
+        // Si c'est un builtin dans un pipeline, on doit le gérer différemment
+        let stdin_fd: Option<i32> = if i == 0 { None } else { Some(pipes[i - 1].0) };
+        let stdout_fd: Option<i32> = if i == n - 1 { None } else { Some(pipes[i].1) };
+
+        // Construire la commande avec redirections de pipes
+        match build_process(cmd, ctx, stdin_fd, stdout_fd) {
+            Ok(Some(mut child)) => {
+                // Fermer les fds dont l'enfant a hérité dans le parent
+                unsafe {
+                    if let Some(fd) = stdin_fd { close(fd); }
+                    if let Some(fd) = stdout_fd { close(fd); }
+                }
+                children.push(child);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{}", e);
+                for (r, w) in &pipes { unsafe { close(*r); close(*w); } }
+                return 127;
+            }
+        }
+    }
+
+    // Fermer tous les fds de pipes dans le parent
+    for (r, w) in &pipes { unsafe { close(*r); close(*w); } }
+
+    let mut last_exit = 0;
+    for (i, mut child) in children.into_iter().enumerate() {
+        if background && i == 0 {
+            let pid = child.id();
+            ctx.jobs.add(pid, "pipeline");
+            last_exit = 0;
+        } else {
+            last_exit = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+        }
+    }
+    last_exit
+}
+
+
+
+pub fn execute_command(
+    cmd: &Command,
+    ctx: &mut ExecContext,
+    stdin_override: Option<i32>,
+    stdout_override: Option<i32>,
+    background: bool,
+) -> i32 {
+    if cmd.argv.is_empty() { return 0; }
+
+    let expanded_argv: Vec<String> = cmd.argv.iter().map(|arg| expand_vars(arg, ctx)).collect();
+    let expanded_argv = expand_args(&expanded_argv);
+
+    if let Some(exit_code) = try_builtin(&expanded_argv, ctx) { return exit_code; }
+
+    match build_process_with_argv(cmd, &expanded_argv, ctx, stdin_override, stdout_override) {
+        Ok(Some(mut child)) => {
+            if background {
+                let pid = child.id();
+                ctx.jobs.add(pid, expanded_argv.join(" ").as_str());
+                println!("[{}] {}", ctx.jobs.len(), pid);
+                0
+            } else {
+                child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+            }
+        }
+        Ok(None) => ctx.last_exit,
+        Err(e) => { eprintln!("{}", e); 127 }
+    }
+}
+
+fn build_process(
+    cmd: &Command,
+    ctx: &mut ExecContext,
+    stdin_fd: Option<i32>,
+    stdout_fd: Option<i32>,
+) -> Result<Option<process::Child>, String> {
+    let expanded_argv: Vec<String> = cmd.argv.iter().map(|arg| expand_vars(arg, ctx)).collect();
+    build_process_with_argv(cmd, &expanded_argv, ctx, stdin_fd, stdout_fd)
+}
+
+fn build_process_with_argv(
+    cmd: &Command,
+    argv: &[String],
+    ctx: &mut ExecContext,
+    stdin_fd: Option<i32>,
+    stdout_fd: Option<i32>,
+) -> Result<Option<process::Child>, String> {
+    if argv.is_empty() { return Err("rustshell: commande vide".into()); }
+    let name = &argv[0];
+    let path = resolve_path(name, ctx).ok_or_else(|| format!("rustshell: {}: commande introuvable", name))?;
+    let mut proc = process::Command::new(&path);
+    proc.args(&argv[1..]);
+    proc.env_clear();
+    for (k, v) in &ctx.env { proc.env(k, v); }
+
+    if let Some(fd) = stdin_fd {
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        proc.stdin(Stdio::from(f));
+    } else { apply_stdin_redirect(cmd, &mut proc)?; }
+
+    if let Some(fd) = stdout_fd {
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        proc.stdout(Stdio::from(f));
+    } else { apply_stdout_redirect(cmd, &mut proc)?; }
+
+    apply_stderr_redirect(cmd, &mut proc)?;
+    let child = proc.spawn().map_err(|e| format!("rustshell: {}: {}", name, e))?;
+    Ok(Some(child))
+}
+
+
+fn apply_stdin_redirect(cmd: &Command, proc: &mut process::Command) -> Result<(), String> {
+    for r in &cmd.redirects {
+        if r.kind == RedirectKind::Stdin {
+            let path = match &r.target { RedirectTarget::File(p) | RedirectTarget::FileAppend(p) => p };
+            let file = std::fs::File::open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+            proc.stdin(Stdio::from(file));
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn apply_stdout_redirect(cmd: &Command, proc: &mut process::Command) -> Result<(), String> {
+    for r in &cmd.redirects {
+        match (&r.kind, &r.target) {
+            (RedirectKind::Stdout, RedirectTarget::File(path)) => {
+                let file = OpenOptions::new().write(true).create(true).truncate(true).open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+                proc.stdout(Stdio::from(file));
+                return Ok(());
+            }
+            (RedirectKind::Stdout, RedirectTarget::FileAppend(path)) => {
+                let file = OpenOptions::new().write(true).create(true).append(true).open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+                proc.stdout(Stdio::from(file));
+                return Ok(());
+            }
+            (RedirectKind::StdoutStderr, RedirectTarget::File(path)) => {
+                let file = OpenOptions::new().write(true).create(true).truncate(true).open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+                let file2 = file.try_clone().map_err(|e| e.to_string())?;
+                proc.stdout(Stdio::from(file));
+                proc.stderr(Stdio::from(file2));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn apply_stderr_redirect(cmd: &Command, proc: &mut process::Command) -> Result<(), String> {
+    for r in &cmd.redirects {
+        if r.kind == RedirectKind::Stderr {
+            let path = match &r.target { RedirectTarget::File(p) | RedirectTarget::FileAppend(p) => p };
+            let file = OpenOptions::new().write(true).create(true).truncate(true).open(path).map_err(|e| format!("rustshell: {}: {}", path, e))?;
+            proc.stderr(Stdio::from(file));
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+pub fn resolve_path(name: &str, ctx: &ExecContext) -> Option<String> {
+    if name.contains('/') {
+        if std::path::Path::new(name).exists() { return Some(name.to_string()); }
+        return None;
+    }
+    let path_env = ctx.env.get("PATH").map(|s| s.as_str()).unwrap_or("/usr/local/bin:/usr/bin:/bin");
+    for dir in path_env.split(':') {
+        let full = format!("{}/{}", dir, name);
+        if std::path::Path::new(&full).exists() { return Some(full); }
+    }
+    None
+}
+
+
+/// PARTIE DE NOËLLY : EXPANSION ET BUILTINS
+/// Tâches : expand_vars, command_substitution, try_builtin, et tous les builtin_ (cd, pwd, export, etc.).
+
+pub fn expand_vars(s: &str, ctx: &mut ExecContext) -> String {
+    let mut result = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            i += 1;
+            if i >= bytes.len() { result.push('$'); break; }
+            if bytes[i] == b'(' {
+                i += 1; let start = i; let mut depth = 1usize;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'(' => { depth += 1; i += 1; }
+                        b')' => { depth -= 1; if depth == 0 { break; } i += 1; }
+                        _ => { i += 1; }
+                    }
+                }
+                let cmd_str = &s[start..i];
+                if i < bytes.len() { i += 1; }
+                let output = command_substitution(cmd_str, ctx);
+                result.push_str(&output);
+            } else if bytes[i] == b'{' {
+                i += 1; let start = i;
+                while i < bytes.len() && bytes[i] != b'}' { i += 1; }
+                let var = &s[start..i];
+                if i < bytes.len() { i += 1; }
+                let val = ctx.env.get(var).map(|s| s.as_str()).unwrap_or("");
+                result.push_str(val);
+            } else if bytes[i] == b'?' {
+                result.push_str(&ctx.last_exit.to_string());
+                i += 1;
+            } else if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+                let var = &s[start..i];
+                let val = ctx.env.get(var).map(|s| s.as_str()).unwrap_or("");
+                result.push_str(val);
+            } else { result.push('$'); }
+        } else { result.push(bytes[i] as char); i += 1; }
+    }
+    result
+}
+
+pub fn command_substitution(cmd_str: &str, ctx: &mut ExecContext) -> String {
+    use std::process::{Command, Stdio};
+    let tokens = match crate::lexer::tokenize(cmd_str) { Ok(t) => t, Err(_) => return String::new() };
+    let list = match crate::pipes::parse(&tokens) { Ok(l) => l, Err(_) => return String::new() };
+    if list.items.is_empty() { return String::new(); }
+    let pipeline = &list.items[0].pipeline;
+    if pipeline.commands.is_empty() { return String::new(); }
+    let first_cmd = &pipeline.commands[0];
+    if first_cmd.argv.is_empty() { return String::new(); }
+    let name = &first_cmd.argv[0];
+    let path = match resolve_path(name, ctx) { Some(p) => p, None => return String::new() };
+    let output = Command::new(&path).args(&first_cmd.argv[1..]).envs(ctx.env.iter()).stdout(Stdio::piped()).stderr(Stdio::null()).output();
+    match output {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            s.trim_end_matches('\n').trim_end_matches('\r').to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+fn try_builtin(argv: &[String], ctx: &mut ExecContext) -> Option<i32> {
+    match argv.first().map(|s| s.as_str()) {
+        Some("cd")     => Some(builtin_cd(argv, ctx)),
+        Some("pwd")    => Some(builtin_pwd()),
+        Some("exit")   => Some(builtin_exit(argv, ctx)),
+        Some("export") => Some(builtin_export(argv, ctx)),
+        Some("unset")  => Some(builtin_unset(argv, ctx)),
+        Some("echo")   => Some(builtin_echo(argv)),
+        Some("true")   => Some(0),
+        Some("false")  => Some(1),
+        Some("type")   => Some(builtin_type(argv, ctx)),
+        Some("hash")   => Some(0),
+        _ => None,
+    }
+}
+
+fn builtin_cd(argv: &[String], ctx: &mut ExecContext) -> i32 {
+    let target = match argv.get(1) { Some(d) => d.clone(), None => ctx.env.get("HOME").cloned().unwrap_or_else(|| "/".to_string()) };
+    match std::env::set_current_dir(&target) {
+        Ok(_) => {
+            if let Ok(cwd) = std::env::current_dir() {
+                let s = cwd.to_string_lossy().to_string();
+                ctx.env.insert("OLDPWD".into(), ctx.env.get("PWD").cloned().unwrap_or_default());
+                ctx.env.insert("PWD".into(), s);
+            }
+            0
+        }
+        Err(e) => { eprintln!("\x1b[91mrustshell: cd: {}: {}\x1b[0m", target, e); 1 }
+    }
+}
+
+fn builtin_pwd() -> i32 {
+    match std::env::current_dir() {
+        Ok(p) => { println!("{}", p.display()); 0 }
+        Err(e) => { eprintln!("\x1b[91mrustshell: pwd: {}\x1b[0m", e); 1 }
+    }
+}
+
+fn builtin_exit(argv: &[String], ctx: &ExecContext) -> i32 {
+    let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(ctx.last_exit);
+    std::process::exit(code);
+}
+
+fn builtin_export(argv: &[String], ctx: &mut ExecContext) -> i32 {
+    if argv.len() == 1 {
+        let mut vars: Vec<_> = ctx.env.iter().collect();
+        vars.sort_by_key(|(k, _)| k.as_str());
+        for (k, v) in vars { println!("declare -x {}=\"{}\"", k, v); }
+        return 0;
+    }
+    for arg in &argv[1..] {
+        if let Some(eq) = arg.find('=') {
+            let key = arg[..eq].to_string();
+            let val = arg[eq+1..].to_string();
+            ctx.env.insert(key.clone(), val.clone());
+            unsafe {
+                std::env::set_var(&key, &val);
+            }
+        } else if let Ok(val) = std::env::var(arg) { ctx.env.insert(arg.clone(), val); }
+    }
+    0
+}
+
+fn builtin_unset(argv: &[String], ctx: &mut ExecContext) -> i32 {
+    for arg in &argv[1..] {
+        ctx.env.remove(arg);
+        unsafe {
+            std::env::remove_var(arg);
+        }
+    }
+    0
+}
+
+fn builtin_echo(argv: &[String]) -> i32 {
+    let (newline, start) = if argv.get(1).map(|s| s.as_str()) == Some("-n") { (false, 2) } else { (true, 1) };
+    let out = argv[start..].join(" ");
+    if newline { println!("{}", out); } else { print!("{}", out); }
+    0
+}
+
+fn builtin_type(argv: &[String], ctx: &ExecContext) -> i32 {
+    let mut exit = 0;
+    let builtins = ["cd","pwd","exit","export","unset","echo","true","false","type","history","jobs","fg","bg","clear","help"];
+    for name in &argv[1..] {
+        if builtins.contains(&name.as_str()) { println!("{} est un builtin du shell", name); }
+        else if let Some(path) = resolve_path(name, ctx) { println!("{} est {}", name, path); }
+        else { eprintln!("\x1b[91mrustshell: type: {}: introuvable\x1b[0m", name); exit = 1; }
+    }
+    exit
+}
+
